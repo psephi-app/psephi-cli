@@ -116,6 +116,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           branch="psephi-$version"
+          gh auth setup-git  # git push to the tap with the App token
           gh repo clone "$TAP" tap -- --depth 1
           cd tap
           git config user.name "psephi release"

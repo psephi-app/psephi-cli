@@ -1,0 +1,130 @@
+# Release on a tag v*: build → PyPI (trusted publishing, OIDC, no tokens) → build provenance
+# attestation → GitHub Release → PR with the new formula to the tap psephi-app/homebrew-psephi.
+#
+# One-time setup by the owner — see README, «Releasing»: PyPI trusted publisher for this
+# workflow and the `pypi` environment, a GitHub App (or fine-grained token) for the tap.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: Tag matches the package version
+        run: |
+          version=$(grep -Po '^__version__ = "\K[^"]+' src/psephi/__init__.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but src/psephi/__init__.py says $version"
+            exit 1
+          fi
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run pytest
+      - run: uv build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/psephi/
+    permissions:
+      id-token: write  # trusted publishing: PyPI trusts this workflow's OIDC token
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  attest:
+    needs: pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  github-release:
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release with wheel and sdist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "psephi ${GITHUB_REF_NAME#v}" --generate-notes \
+            --verify-tag
+
+  homebrew:
+    needs: pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAP: psephi-app/homebrew-psephi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: Render the formula from PyPI and uv.lock
+        run: uv run python packaging/homebrew/render_formula.py --from-pypi "${GITHUB_REF_NAME#v}" > psephi.rb
+      - name: Token for the tap (GitHub App)
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: psephi-app
+          repositories: homebrew-psephi
+      - name: Open a PR in the tap
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          branch="psephi-$version"
+          gh repo clone "$TAP" tap -- --depth 1
+          cd tap
+          git config user.name "psephi release"
+          git config user.email "noreply@psephi.app"
+          git checkout -b "$branch"
+          mkdir -p Formula
+          cp ../psephi.rb Formula/psephi.rb
+          git add Formula/psephi.rb
+          git commit -m "psephi $version"
+          git push origin "$branch"
+          gh pr create --repo "$TAP" --head "$branch" --title "psephi $version" \
+            --body "Formula for psephi $version from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME} (rendered by packaging/homebrew/render_formula.py)."

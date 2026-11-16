@@ -1,0 +1,2997 @@
+# Snapshot of the public Psephi API schema (GET /v1/schema/), taken 2026-11-15.
+# Refresh: download it again and update the date; tests/test_contract.py checks every call against it.
+openapi: 3.0.3
+info:
+  title: Psephi public API
+  version: v1
+  description: |-
+    The Psephi public API gives your own scripts and programs access to your personal finances in Psephi: profile, transactions, accounts and balances, categories and analytics.
+
+    - Base URL: `https://api.psephi.app/v1/`. Requests and responses are JSON in UTF-8; dates are ISO 8601, money is a decimal string with its currency (`{"amount": "42.5000", "currency": "PLN"}`) — never parse it into a float.
+    - This page is generated from the OpenAPI schema: [`/v1/schema/`](/v1/schema/) (YAML, `?format=json` for JSON). The version root [`/v1/`](/v1/) links to the schema, this documentation, the compatibility policy and the error catalog.
+    - You only ever see your own data: someone else's object answers `404`, exactly like a missing one.
+
+    # Quick start
+
+    ## 1. Get a token
+
+    **Personal token** — for your scripts, dashboards and CI. In the Psephi app open **Account → API tokens**, name the token, tick the scopes it needs and choose how long it lives. The token (`psephi_pat_…`) is shown **once**: copy it and keep it like a password. Psephi stores only its hash; a lost token is revoked and replaced, not recovered. You can also list, create and revoke tokens through the API (`/v1/tokens/`, scope `account`).
+
+    **Sign-in through the browser (OAuth 2.1)** — for programs that should not ask you to paste a token. The API host is an OAuth 2.1 authorization server, discovered from [`/.well-known/oauth-authorization-server`](/.well-known/oauth-authorization-server) (RFC 8414); a `401` from `/v1` points to [`/.well-known/oauth-protected-resource`](/.well-known/oauth-protected-resource) (RFC 9728) in `WWW-Authenticate`.
+
+    - *Authorization code with PKCE* (S256 only, `state` required) and a loopback redirect `http://127.0.0.1:<port>/callback` — for programs on your computer. You approve the scopes on the consent page in the app; the program exchanges the code at `POST /oauth/token`.
+    - *Device code* (RFC 8628) — for servers and SSH sessions without a browser: `POST /oauth/device_authorization` returns a code that you enter at `https://psephi.app/device`; the program polls `POST /oauth/token`.
+    - Access tokens (`psephi_oat_…`) live one hour; refresh tokens (`psephi_ort_…`) are single-use and rotate on every refresh. Connected programs are listed in **Account → Connected apps**, where one click disconnects them.
+    - OAuth clients are registered by Psephi; the first one is the `psephi` command-line tool (`client_id=psephi-cli`). Registration of third-party clients is not open yet.
+
+    ## 2. Make the first request
+
+    ```bash
+    export PSEPHI_TOKEN=psephi_pat_…
+
+    curl -s https://api.psephi.app/v1/me/ \
+      -H "Authorization: Bearer $PSEPHI_TOKEN"
+    ```
+
+    ```json
+    {"id": "0b0f8d1e-2c55-4c43-9a3e-1f0c2b6b7a10", "email": "anna@example.com", "display_name": "Anna", "locale": "en", "base_currency": "EUR"}
+    ```
+
+    `GET /v1/token/` tells which token made the request, its scopes and expiry — handy for checking a token. Then list recent transactions (scope `transactions:read`):
+
+    ```bash
+    curl -s "https://api.psephi.app/v1/transactions/?page_size=20" \
+      -H "Authorization: Bearer $PSEPHI_TOKEN"
+    ```
+
+    ## 3. Handle errors, pages and limits
+
+    Read on: every error is `application/problem+json` with a stable `code` ([Errors](#section/Errors)), lists are paged with a cursor ([Pagination](#section/Pagination)), and each token has a request budget ([Rate limits](#section/Rate-limits)).
+
+    # Authentication and scopes
+
+    Every `/v1` request except the version root, the schema, this documentation and the error catalog carries `Authorization: Bearer <token>` — a personal token or an OAuth access token; both have the same scopes. There are no cookies and no CSRF on this host.
+
+    A scope is `<resource>:<access>`, access being `read` or `write`; write on a resource also grants read on it. Each operation lists the scopes it needs in `x-required-scopes` (an empty list means any valid token). Give every program its own token with only the scopes it needs.
+
+    | Scope | Grants |
+    |---|---|
+    | `account:read` | read: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes). |
+    | `account:write` | read and write: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes). |
+    | `transactions:read` | read: Transactions: list, details, create, edit and delete, attachments. |
+    | `transactions:write` | read and write: Transactions: list, details, create, edit and delete, attachments. |
+    | `accounts:read` | read: Accounts and their settings: balances, groups, loan and deposit terms. |
+    | `accounts:write` | read and write: Accounts and their settings: balances, groups, loan and deposit terms. |
+    | `analytics:read` | read: Analytics: reports, summaries, budgets and plans — what is computed from transactions. |
+    | `analytics:write` | read and write: Analytics: reports, summaries, budgets and plans — what is computed from transactions. |
+    | `categorization:read` | read: Categorization: categories, rules and keywords, labelling transactions. |
+    | `categorization:write` | read and write: Categorization: categories, rules and keywords, labelling transactions. |
+
+    - No `Authorization` header — `401 not_authenticated`; an unknown token — `401 authentication_failed`; an expired or revoked one — `401 token_expired` / `token_revoked`. All of them carry `WWW-Authenticate: Bearer …`.
+    - A token without the needed scope — `403 insufficient_scope`; the scopes the operation needs are in `required_scopes`.
+
+    # Pagination
+
+    Every list in `/v1` is paged the same way, with a cursor.
+
+    ```json
+    {"next": "https://api.psephi.app/v1/transactions/?cursor=cD0yMDI2…", "previous": null, "results": [ … ]}
+    ```
+
+    - `next` and `previous` are full URLs of the neighbouring pages, `null` at the edge. Follow `next` until it is `null`. There is no total count.
+    - `page_size` — rows per page: 50 by default, at most 200 (more is cut to 200).
+    - Rows come newest first by a unique, immutable key, so a row added between requests does not shift the pages: nothing repeats and nothing is lost. Lists in `/v1` have no `?ordering=`.
+    - The cursor is opaque: take it from `next`/`previous`, never build or parse it. A broken cursor is `400 invalid_cursor`.
+
+    # Rate limits
+
+    Each token may make 120 requests per fixed 60-second window (the defaults; separate tokens have separate budgets). Every response to a request with a token carries:
+
+    | Header | Meaning |
+    |---|---|
+    | `RateLimit-Limit` | requests allowed in the window |
+    | `RateLimit-Remaining` | requests left in the current window |
+    | `RateLimit-Reset` | seconds until the window resets |
+    | `RateLimit-Policy` | limit and window length, e.g. `120;w=60` |
+
+    Beyond the limit the API answers `429` with code `throttled`, a `Retry-After` header and the same number in `retry_after`. Wait that many seconds before retrying; a program that needs more should get a token of its own.
+
+    # Call log
+
+    Psephi keeps a log of calls made with your tokens for 90 days: time, token, method, path without the query string, status, duration, IP and headers — with `Authorization`, cookies and anything token-like removed before storing; bodies are not stored. Read it in **Account → API tokens** or with `GET /v1/api-calls/` (scope `account:read`).
+
+    # Errors
+
+    Errors follow RFC 9457, `Content-Type: application/problem+json`:
+
+    ```json
+    {
+      "type": "https://psephi.app/problems/insufficient_scope",
+      "title": "Insufficient token scope",
+      "status": 403,
+      "detail": "The API token lacks the scope for this action",
+      "instance": "/v1/transactions/5b7c3c1a-6f2e-4c1b-8a5d-2f3e4d5c6b7a/",
+      "code": "insufficient_scope",
+      "required_scopes": ["transactions:write"]
+    }
+    ```
+
+    - Branch on `code` — it is stable. `title` and `detail` are human text in the language of the request (`Accept-Language`) and may change at any time.
+    - `type` identifies the code; it is not a page address.
+    - Validation errors (`400 validation_error`) list field errors in `fields`: a dotted path → `[{"code", "message"}]`.
+    - The OAuth endpoints (`/oauth/…`) answer errors in the OAuth format instead (RFC 6749, `{"error", "error_description"}`).
+
+    The full catalog, with a description of each code, is also served as JSON without a token: [`GET /v1/problems/`](/v1/problems/); the `Problem` schema below lists the same descriptions. New codes may appear for new cases; a code never changes its meaning.
+
+    | Code | Status | Title |
+    |---|---|---|
+    | `bad_request` | 400 | Bad request |
+    | `validation_error` | 400 | Invalid input |
+    | `parse_error` | 400 | Malformed request |
+    | `invalid_cursor` | 400 | Invalid page cursor |
+    | `not_authenticated` | 401 | Not signed in |
+    | `authentication_failed` | 401 | Authentication failed |
+    | `permission_denied` | 403 | Access denied |
+    | `csrf_failed` | 403 | CSRF check failed |
+    | `not_found` | 404 | Not found |
+    | `method_not_allowed` | 405 | Method not allowed |
+    | `not_acceptable` | 406 | Not acceptable |
+    | `conflict` | 409 | Conflict |
+    | `gone` | 410 | Gone |
+    | `payload_too_large` | 413 | Request too large |
+    | `unsupported_media_type` | 415 | Unsupported media type |
+    | `throttled` | 429 | Too many requests |
+    | `server_error` | 500 | Server error |
+    | `not_implemented` | 501 | Not implemented |
+    | `bad_gateway` | 502 | Upstream service failed |
+    | `service_unavailable` | 503 | Service unavailable |
+    | `pending_approval` | 403 | Sign-up awaiting approval |
+    | `reauth` | 403 | Sign in again |
+    | `wrong_credentials` | 400 | Wrong email or password |
+    | `wrong_code` | 400 | Wrong code |
+    | `invalid_code` | 400 | Invalid code or link |
+    | `login_expired` | 400 | Sign-in expired |
+    | `key_rejected` | 400 | Passkey not accepted |
+    | `too_many_attempts` | 429 | Too many attempts |
+    | `last_second_factor` | 409 | Last second method |
+    | `no_second_factor` | 400 | No second method |
+    | `email_same` | 400 | Same address |
+    | `email_taken` | 400 | Address taken |
+    | `email_changed_recently` | 409 | Address changed recently |
+    | `email_change_waiting` | 409 | Address change already waiting |
+    | `email_change_limit` | 429 | Too many address changes |
+    | `email_sent_recently` | 429 | Email just sent |
+    | `nothing_to_confirm` | 404 | Nothing to confirm |
+    | `token_expired` | 401 | API token expired |
+    | `token_revoked` | 401 | API token revoked |
+    | `insufficient_scope` | 403 | Insufficient token scope |
+    | `oauth_invalid_request` | 400 | Invalid authorization request |
+    | `too_many_connections` | 409 | Too many connected apps |
+    | `personal_token_required` | 403 | Personal token required |
+    | `too_many_tokens` | 409 | Too many tokens |
+    | `in_use` | 409 | In use |
+    | `duplicate` | 409 | Already exists |
+    | `deleted` | 410 | Deleted |
+    | `resync` | 410 | Download everything again |
+    | `import_in_progress` | 409 | Import in progress |
+    | `not_recognized` | 400 | File not recognized |
+    | `password_required` | 400 | PDF password required |
+    | `password_wrong` | 400 | Wrong PDF password |
+    | `sync_rejected` | 400 | Change rejected |
+    | `keywords_rejected` | 400 | Keywords not imported |
+    | `credential_revoked` | 409 | Application key revoked |
+    | `sync_in_progress` | 409 | Already syncing |
+    | `bank_error` | 400 | Bank refused |
+
+    # Versioning and deprecation
+
+    The version is the first segment of the path: `/v1/`. These rules are part of the API contract.
+
+    ## What may change within v1
+
+    Without notice, in the current version:
+
+    - new endpoints, methods, optional request fields and query parameters;
+    - new response fields, new optional headers, new error codes for new cases;
+    - new values of enumerations **in responses** — a client must tolerate values it does not know;
+    - accepting more than before (looser validation) and fixing responses that contradicted the schema;
+    - the text of `title` and `detail` of errors.
+
+    Do not rely on the order of fields, on the absence of new fields or on the text of errors.
+
+    ## Breaking changes
+
+    A breaking change is anything after which a correctly written client stops working. Such changes are made **only in a new major version** (`/v2/`):
+
+    - removing or renaming an endpoint, method, response field or query parameter;
+    - changing the type, format, units or meaning of a field (string ↔ number, date format, precision of amounts);
+    - making an optional request field required, rejecting what used to be accepted;
+    - a response field that was always present becoming absent or `null`;
+    - removing an enumeration value; changing the error `code` or HTTP status for the same case;
+    - changing pagination, the default order, authentication or the scopes an existing endpoint needs.
+
+    Every change of the schema is checked for breaking changes before release.
+
+    ## Versions and support
+
+    - A new major version runs next to the old one: `/v1/` and `/v2/` work at the same time until the old one's sunset date.
+    - An old version is supported for **at least 12 months** after its successor is released and it is announced as deprecated. A single deprecated endpoint also keeps working for at least 12 months after it is marked.
+
+    ## Deprecation headers
+
+    A deprecated endpoint keeps working as before and adds to every response, errors included:
+
+    - `Deprecation: @<Unix seconds>` — since when it is deprecated (RFC 9745);
+    - `Sunset: <HTTP date>` — after which it stops answering (RFC 8594);
+    - `Link: <url>; rel="deprecation"` (and `rel="sunset"` when a sunset date is set) — where the replacement is described.
+
+    ```
+    Deprecation: @1796083200
+    Sunset: Wed, 01 Dec 2027 00:00:00 GMT
+    Link: <https://api.psephi.app/v1/policy/>; rel="deprecation", <https://api.psephi.app/v1/policy/>; rel="sunset"
+    ```
+
+    In the schema such an operation is marked `deprecated: true`.
+
+    ## Deprecation process
+
+    1. The replacement is ready and documented (a new version or a new endpoint).
+    2. The old endpoint is marked deprecated with a sunset date at least 12 months ahead, and the change is announced in “What's new” in the app and in this documentation.
+    3. Until the sunset date it works as before. After it, it answers `410 gone` for at least 3 more months and is then removed.
+
+    Exception: a security vulnerability or a legal requirement may shorten these periods, up to immediate shutdown, announced at once.
+paths:
+  /.well-known/oauth-authorization-server:
+    get:
+      operationId: oauth_server_metadata
+      description: 'RFC 8414: endpoints, grant types, PKCE S256, scopes.'
+      summary: Authorization server metadata
+      tags:
+      - .well-known
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: oauth_resource_metadata
+      description: 'RFC 9728: the `/v1` resource, its authorization server and scopes.
+        The address is in `resource_metadata` of the `WWW-Authenticate` header of
+        a 401 response.'
+      summary: Protected resource metadata
+      tags:
+      - .well-known
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /oauth/device_authorization:
+    post:
+      operationId: oauth_device_authorization
+      description: 'RFC 8628: device_code is for the client to poll `/oauth/token`,
+        user_code is for the person to enter on the verification_uri page. Valid for
+        5 minutes.'
+      summary: Device code
+      tags:
+      - oauth
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/OAuthDeviceRequestRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthDeviceResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+          description: ''
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /oauth/revoke:
+    post:
+      operationId: oauth_revoke
+      description: 'RFC 7009: revoking an access or refresh token ends the whole connection.
+        Answers 200 for an unknown or already revoked token too.'
+      summary: Revoke OAuth token
+      tags:
+      - oauth
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/OAuthRevokeRequestRequest'
+        required: true
+      responses:
+        '200':
+          description: Revoked, or there was no such token.
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /oauth/token:
+    post:
+      operationId: oauth_token
+      description: Authorization code exchange with PKCE (S256), refresh with rotation
+        (reusing an old refresh token revokes the connection) and device code polling
+        (authorization_pending, slow_down, access_denied, expired_token). Errors follow
+        RFC 6749, 5.2.
+      summary: OAuth token
+      tags:
+      - oauth
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/OAuthTokenRequestRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthTokenResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+          description: ''
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/:
+    get:
+      operationId: v1_root
+      description: Public API version and links to its schema, documentation, compatibility
+        policy and error catalog. No token needed.
+      summary: Version root
+      tags:
+      - v1
+      security:
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Root'
+              examples:
+                Root:
+                  value:
+                    version: v1
+                    links:
+                      self: https://api.psephi.app/v1/
+                      schema: https://api.psephi.app/v1/schema/
+                      docs: https://api.psephi.app/v1/docs/
+                      policy: https://api.psephi.app/v1/policy/
+                      problems: https://api.psephi.app/v1/problems/
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/accounts/:
+    get:
+      operationId: v1_accounts_list
+      description: Own accounts and subaccounts, archived ones included; cursor pagination.
+        Scope `accounts:read`.
+      summary: Accounts
+      parameters:
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedV1AccountList'
+              examples:
+                Account:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - id: 9e1d2c3b-4a5f-4e6d-8c7b-1a2b3c4d5e6f
+                      name: mBank PLN
+                      kind: current
+                      currency: PLN
+                      parent: null
+                      archived: false
+                      include_in_net_worth: true
+                      created_at: '2026-01-03T10:00:00Z'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - accounts:read
+  /v1/accounts/{id}/:
+    get:
+      operationId: v1_accounts_retrieve
+      description: Account settings; someone else's or a missing one answers 404.
+        Scope `accounts:read`.
+      summary: Account
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Account'
+              examples:
+                Account:
+                  value:
+                    id: 9e1d2c3b-4a5f-4e6d-8c7b-1a2b3c4d5e6f
+                    name: mBank PLN
+                    kind: current
+                    currency: PLN
+                    parent: null
+                    archived: false
+                    include_in_net_worth: true
+                    created_at: '2026-01-03T10:00:00Z'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - accounts:read
+    patch:
+      operationId: v1_accounts_update
+      description: Only `name`, `archived` and `include_in_net_worth`; other fields
+        answer 400. Scope `accounts:write`.
+      summary: Change name and visibility
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedV1AccountUpdateRequest'
+            examples:
+              Archive:
+                value:
+                  archived: true
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedV1AccountUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedV1AccountUpdateRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Account'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - accounts:write
+  /v1/analytics/balances/:
+    get:
+      operationId: v1_analytics_balances
+      description: Current balances of own accounts and subaccounts, each in its own
+        currency; archived ones included, internal ones left out. Cursor pagination.
+        Scope `analytics:read`.
+      summary: Account balances
+      parameters:
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedV1BalanceList'
+              examples:
+                Balance:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - account: 9e1d2c3b-4a5f-4e6d-8c7b-1a2b3c4d5e6f
+                      name: mBank PLN
+                      balance:
+                        amount: '1520.3000'
+                        currency: PLN
+                      booked_balance:
+                        amount: '1562.8000'
+                        currency: PLN
+                      on_hold:
+                        amount: '-42.5000'
+                        currency: PLN
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - analytics:read
+  /v1/analytics/categories/:
+    get:
+      operationId: v1_analytics_categories
+      description: 'Summary for a period: spending and income by category, in the
+        currencies of the transactions. The period is `date_from` (required) to `date_to`
+        (today by default), inclusive. Scope `analytics:read`.'
+      summary: Spending and income by category
+      parameters:
+      - in: query
+        name: date_from
+        schema:
+          type: string
+          format: date
+        description: Start of the period.
+        required: true
+      - in: query
+        name: date_to
+        schema:
+          type: string
+          format: date
+        description: End of the period; today by default.
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategorySummary'
+              examples:
+                October:
+                  value:
+                    date_from: '2026-10-01'
+                    date_to: '2026-10-31'
+                    expense:
+                    - category: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                      amount:
+                        amount: '184.5000'
+                        currency: PLN
+                    income:
+                    - category: 2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d
+                      amount:
+                        amount: '9800.0000'
+                        currency: PLN
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - analytics:read
+  /v1/api-calls/:
+    get:
+      operationId: v1_api_calls_list
+      description: 'Calls to `/v1` with the person''s tokens over the last 90 days,
+        newest first: method, path without the query string, response status, duration,
+        IP, headers. Secrets (Authorization, cookies, tokens) are redacted, bodies
+        are not kept. `?token=<id>` filters by token, `?connection=<id>` by connected
+        app, `?status=` by response status. Scope `account:read`.'
+      summary: API call log
+      parameters:
+      - in: query
+        name: connection
+        schema:
+          type: number
+        description: Connected app (OAuth) id
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      - in: query
+        name: status
+        schema:
+          type: integer
+        description: Response status, for example 429
+      - in: query
+        name: token
+        schema:
+          type: number
+        description: Token id
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedApiCallList'
+              examples:
+                Call:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - id: 1042
+                      created_at: '2026-11-14T09:30:00Z'
+                      token: 7
+                      token_prefix: psephi_pat_3fK9xQ2m
+                      token_name: Home dashboard
+                      connection: null
+                      connection_client: null
+                      method: GET
+                      path: /v1/analytics/balances/
+                      status: 200
+                      duration_ms: 38
+                      ip: 203.0.113.7
+                      request_headers:
+                        Authorization: '[redacted]'
+                        User-Agent: curl/8.10.1
+                      response_headers:
+                        Content-Type: application/json
+                        RateLimit-Remaining: '117'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:read
+  /v1/categories/:
+    get:
+      operationId: v1_categories_list
+      description: 'Reference list: system and own categories, groups and subcategories;
+        filter by `type`. Cursor pagination. Scope `categorization:read`.'
+      summary: Categories
+      parameters:
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      - in: query
+        name: type
+        schema:
+          type: string
+          enum:
+          - expense
+          - income
+        description: Only this type.
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedV1CategoryList'
+              examples:
+                Category:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - id: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                      parent: 7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d
+                      type: expense
+                      slug: eating-out-coffee
+                      name: Coffee
+                      is_system: true
+                      enabled: true
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - categorization:read
+  /v1/categories/{id}/:
+    get:
+      operationId: v1_categories_retrieve
+      description: One category; someone else's own category answers 404. Scope `categorization:read`.
+      summary: Category
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Category'
+              examples:
+                Category:
+                  value:
+                    id: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                    parent: 7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d
+                    type: expense
+                    slug: eating-out-coffee
+                    name: Coffee
+                    is_system: true
+                    enabled: true
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - categorization:read
+  /v1/me/:
+    get:
+      operationId: v1_me_retrieve
+      description: Profile of the person the token belongs to. Scope `account:read`.
+      summary: Profile
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Me'
+              examples:
+                Profile:
+                  value:
+                    id: 0b0f8d1e-2c55-4c43-9a3e-1f0c2b6b7a10
+                    email: anna@example.com
+                    display_name: Anna
+                    locale: en
+                    base_currency: EUR
+                    time_zone: Europe/Warsaw
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:read
+    patch:
+      operationId: v1_me_update
+      description: Name, language, base currency and time zone; other fields answer
+        400. Scope `account:write`.
+      summary: Change profile
+      tags:
+      - v1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedV1MeUpdateRequest'
+            examples:
+              ChangeCurrency:
+                value:
+                  base_currency: PLN
+                summary: Change currency
+              ChangeTimeZone:
+                value:
+                  time_zone: Europe/Warsaw
+                summary: Change time zone
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedV1MeUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedV1MeUpdateRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Me'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:write
+  /v1/problems/:
+    get:
+      operationId: v1_problems
+      description: 'Every error `code` the API may answer with in an `application/problem+json`
+        body: its usual HTTP status, title (in the language of the request), type
+        URI and description. No token needed. Branch on `code`; new codes may appear
+        for new cases.'
+      summary: Error catalog
+      tags:
+      - v1
+      security:
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemCatalog'
+              examples:
+                Catalog:
+                  value:
+                    problems:
+                    - code: throttled
+                      status: 429
+                      title: Too many requests
+                      type: https://psephi.app/problems/throttled
+                      description: Rate limit exceeded. How many seconds to wait before
+                        retrying is in `retry_after` and the `Retry-After` header.
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/token/:
+    get:
+      operationId: v1_token_current
+      description: 'The token the request came with: prefix, scopes and expiry. For
+        an OAuth access token (kind=oauth): the expiry and id of its connection, the
+        app in `client` and the end of the token itself in `access_expires_at`. No
+        scope needed.'
+      summary: Current token
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentToken'
+              examples:
+                PersonalToken:
+                  value:
+                    id: 7
+                    name: Home dashboard
+                    prefix: psephi_pat_3fK9xQ2m
+                    scopes:
+                    - accounts:read
+                    - analytics:read
+                    expiry: sliding
+                    expires_at: null
+                    idle_days: 30
+                    valid_until: '2026-12-14T09:30:00Z'
+                    expired: false
+                    created_at: '2026-11-01T18:12:40Z'
+                    last_used_at: '2026-11-14T09:30:00Z'
+                    kind: personal
+                    client: null
+                    access_expires_at: null
+                  summary: Personal token
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes: []
+  /v1/tokens/:
+    get:
+      operationId: v1_tokens_list
+      description: The person's tokens that are not revoked, expired ones included,
+        newest first; cursor pagination, as in every `/v1` list. Scope `account:read`.
+      summary: API tokens
+      parameters:
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedApiTokenList'
+              examples:
+                Token:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - id: 7
+                      name: Home dashboard
+                      prefix: psephi_pat_3fK9xQ2m
+                      scopes:
+                      - accounts:read
+                      - analytics:read
+                      expiry: sliding
+                      expires_at: null
+                      idle_days: 30
+                      valid_until: '2026-12-14T09:30:00Z'
+                      expired: false
+                      created_at: '2026-11-01T18:12:40Z'
+                      last_used_at: '2026-11-14T09:30:00Z'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:read
+    post:
+      operationId: v1_tokens_create
+      description: 'Scope `account:write`. The new token''s scopes are no wider than
+        those of the requesting token (otherwise 403 insufficient_scope), and it does
+        not outlive it (otherwise 400, an error of the `expiry` field): a token valid
+        until a date creates one until no later date; a token sliding for N days creates
+        a sliding one of at most N days or one until a date at most N days away; only
+        a token without expiry creates one without expiry. An OAuth access token cannot
+        create tokens (403 personal_token_required). The token itself is in the `token`
+        field, shown once; the person gets an email.'
+      summary: Create token
+      tags:
+      - v1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiTokenCreateRequest'
+            examples:
+              TokenUntilADate:
+                value:
+                  name: Backup script
+                  scopes:
+                  - transactions:read
+                  - accounts:read
+                  expiry: date
+                  expires_at: '2027-06-30T00:00:00Z'
+                summary: Token until a date
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ApiTokenCreateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ApiTokenCreateRequest'
+        required: true
+      security:
+      - bearerAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiTokenCreated'
+              examples:
+                CreatedToken:
+                  value:
+                    id: 8
+                    name: Backup script
+                    prefix: psephi_pat_Vb71LmQa
+                    scopes:
+                    - transactions:read
+                    - accounts:read
+                    expiry: date
+                    expires_at: '2027-06-30T00:00:00Z'
+                    idle_days: null
+                    valid_until: '2027-06-30T00:00:00Z'
+                    expired: false
+                    created_at: '2026-11-14T10:05:00Z'
+                    last_used_at: null
+                    token: psephi_pat_Vb71LmQa…
+                  summary: Created token
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:write
+  /v1/tokens/{id}/:
+    delete:
+      operationId: v1_tokens_revoke
+      description: Scope `account:write`, with a personal token only (an OAuth token
+        answers 403 personal_token_required). The requesting token can revoke itself.
+        Someone else's or an already revoked token answers 404.
+      summary: Revoke token
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '204':
+          description: No response body
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - account:write
+  /v1/transactions/:
+    get:
+      operationId: v1_transactions_list
+      description: Own transactions across all accounts; filters by period, account,
+        category and review status. Cursor pagination. Scope `transactions:read`.
+      summary: Transactions
+      parameters:
+      - in: query
+        name: account
+        schema:
+          type: string
+        description: Comma-separated account IDs; an account includes its subaccounts.
+      - in: query
+        name: category
+        schema:
+          type: string
+        description: Comma-separated category IDs; a group includes its subcategories,
+          a split expense matches by the categories of its parts.
+      - name: cursor
+        required: false
+        in: query
+        description: 'Page cursor: the value from `next` or `previous` of the previous
+          response. No cursor means the first page. An invalid cursor answers 400
+          `invalid_cursor`.'
+        schema:
+          type: string
+      - in: query
+        name: date_from
+        schema:
+          type: string
+          format: date
+        description: Transaction date on or after.
+      - in: query
+        name: date_to
+        schema:
+          type: string
+          format: date
+        description: Transaction date on or before.
+      - in: query
+        name: in_review
+        schema:
+          type: boolean
+        description: 'true: in the review inbox (as in the web app), false: not in
+          the inbox.'
+      - name: page_size
+        required: false
+        in: query
+        description: 'Rows per page: 50 by default, at most 200 (a larger value is
+          cut down to the limit).'
+        schema:
+          type: integer
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedV1TransactionList'
+              examples:
+                Transaction:
+                  value:
+                    next: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+                    previous: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+                    results:
+                    - id: 5b7c3c1a-6f2e-4c1b-8a5d-2f3e4d5c6b7a
+                      account: 9e1d2c3b-4a5f-4e6d-8c7b-1a2b3c4d5e6f
+                      date: '2026-11-12'
+                      booked_date: '2026-11-13'
+                      status: cleared
+                      kind: expense
+                      direction: debit
+                      amount:
+                        amount: '42.5000'
+                        currency: PLN
+                      original_amount: null
+                      merchant_name: Café Nero
+                      bank_description: CARD 1234 CAFE NERO WARSZAWA
+                      description: Кофе с коллегой
+                      category: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                      confirmed: true
+                      created_at: '2026-11-13T06:10:00Z'
+                      updated_at: '2026-11-13T08:02:11Z'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - transactions:read
+  /v1/transactions/{id}/:
+    get:
+      operationId: v1_transactions_retrieve
+      description: One transaction; someone else's or a missing one answers 404. Scope
+        `transactions:read`.
+      summary: Transaction
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Transaction'
+              examples:
+                Transaction:
+                  value:
+                    id: 5b7c3c1a-6f2e-4c1b-8a5d-2f3e4d5c6b7a
+                    account: 9e1d2c3b-4a5f-4e6d-8c7b-1a2b3c4d5e6f
+                    date: '2026-11-12'
+                    booked_date: '2026-11-13'
+                    status: cleared
+                    kind: expense
+                    direction: debit
+                    amount:
+                      amount: '42.5000'
+                      currency: PLN
+                    original_amount: null
+                    merchant_name: Café Nero
+                    bank_description: CARD 1234 CAFE NERO WARSZAWA
+                    description: Кофе с коллегой
+                    category: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                    confirmed: true
+                    created_at: '2026-11-13T06:10:00Z'
+                    updated_at: '2026-11-13T08:02:11Z'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - transactions:read
+    patch:
+      operationId: v1_transactions_update
+      description: Only `category`, `description` and the `drop_parts` confirmation;
+        other fields answer 400. Scope `transactions:write`.
+      summary: Change category and note
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedV1TransactionUpdateRequest'
+            examples:
+              CategoryAndNote:
+                value:
+                  category: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                  description: Кофе с коллегой
+                summary: Category and note
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedV1TransactionUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedV1TransactionUpdateRequest'
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Transaction'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - transactions:write
+  /v1/transactions/{id}/category-suggestions/:
+    get:
+      operationId: v1_transactions_category_suggestions
+      description: Which category the categorizer would suggest for the transaction
+        and why; transfers, loans and refunds get none. Changes nothing. Scope `categorization:read`.
+      summary: Category suggestions
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Suggestions'
+              examples:
+                Suggestions:
+                  value:
+                    transaction: 5b7c3c1a-6f2e-4c1b-8a5d-2f3e4d5c6b7a
+                    category: null
+                    confidence: 0.62
+                    source: model
+                    suggestions:
+                    - category: 1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b
+                      probability: 0.62
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - categorization:read
+  /v1/transactions/{id}/confirm/:
+    post:
+      operationId: v1_transactions_confirm
+      description: 'The person''s "correct" mark through the API: the transaction
+        leaves the review inbox and the categorizer learns from its category. Repeating
+        it does not duplicate the mark. Scope `transactions:write`.'
+      summary: Confirm transaction
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+        description: 'Resource identifier: the `id` field from a list or a detail
+          response.'
+      tags:
+      - v1
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Transaction'
+          description: ''
+        default:
+          description: Error (problem+json)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      x-required-scopes:
+      - transactions:write
+components:
+  schemas:
+    AccountKindEnum:
+      enum:
+      - current
+      - savings
+      - deposit
+      - credit_card
+      - loan
+      - mortgage
+      - bnpl
+      - brokerage
+      - cash
+      - paid_by_others
+      type: string
+      description: |-
+        * `current` - Current
+        * `savings` - Savings
+        * `deposit` - Deposit
+        * `credit_card` - Credit Card
+        * `loan` - Loan
+        * `mortgage` - Mortgage
+        * `bnpl` - Bnpl
+        * `brokerage` - Brokerage
+        * `cash` - Cash
+        * `paid_by_others` - Paid By Others
+    ApiCall:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+          description: Log entry id
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          description: When the request arrived
+        token:
+          type: integer
+          readOnly: true
+          nullable: true
+          description: Personal token id; null if none
+        token_prefix:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Token prefix
+        token_name:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Token name
+        connection:
+          type: integer
+          readOnly: true
+          nullable: true
+          description: Connected app (OAuth) id; null if none
+        connection_client:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Name of the connected app (OAuth), if the call used its token
+        method:
+          type: string
+          readOnly: true
+          description: HTTP method
+        path:
+          type: string
+          readOnly: true
+          description: Path without the query string
+        status:
+          type: integer
+          readOnly: true
+          description: Response status
+        duration_ms:
+          type: integer
+          readOnly: true
+          description: Response time, ms
+        ip:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Client IP address
+        request_headers:
+          type: object
+          additionalProperties:
+            type: string
+          readOnly: true
+          description: Request headers; secrets (Authorization, cookies, tokens) are
+            `[redacted]`.
+        response_headers:
+          type: object
+          additionalProperties:
+            type: string
+          readOnly: true
+          description: Response headers, with the same secrets redacted.
+      required:
+      - connection
+      - connection_client
+      - created_at
+      - duration_ms
+      - id
+      - ip
+      - method
+      - path
+      - request_headers
+      - response_headers
+      - status
+      - token
+      - token_name
+      - token_prefix
+    ApiToken:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        prefix:
+          type: string
+          readOnly: true
+          description: Start of the token (psephi_pat_…), to recognize it in the list.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopesEnum'
+          readOnly: true
+          description: 'Token scopes: write on a resource also grants read; read is
+            not listed apart.'
+        expiry:
+          allOf:
+          - $ref: '#/components/schemas/ExpiryEnum'
+          readOnly: true
+          description: |-
+            Expiry kind: date (until a date), never, sliding (expires after idle_days without use).
+
+            * `date` - until a date
+            * `never` - never expires
+            * `sliding` - N days after the last use
+        expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'For expiry=date: when it expires'
+        idle_days:
+          type: integer
+          readOnly: true
+          nullable: true
+          description: 'For expiry=sliding: days without use before it expires'
+        valid_until:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'When it expires: the date, or the last use plus idle_days;
+            null: never.'
+        expired:
+          type: boolean
+          readOnly: true
+          description: 'Expired: the token no longer signs in.'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        last_used_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: Last use, to the minute.
+      required:
+      - created_at
+      - expired
+      - expires_at
+      - expiry
+      - id
+      - idle_days
+      - last_used_at
+      - name
+      - prefix
+      - scopes
+      - valid_until
+    ApiTokenCreateRequest:
+      type: object
+      description: 'Expiry of a token or an OAuth connection: its kind and the matching
+        field.'
+      properties:
+        expiry:
+          allOf:
+          - $ref: '#/components/schemas/ExpiryEnum'
+          description: |-
+            date: until expires_at, never: no expiry, sliding: idle_days after the last use.
+
+            * `date` - until a date
+            * `never` - never expires
+            * `sliding` - N days after the last use
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 'For expiry=date: when it expires, in the future.'
+        idle_days:
+          type: integer
+          maximum: 365
+          minimum: 1
+          nullable: true
+          description: 'For expiry=sliding: days without use before it expires.'
+        name:
+          type: string
+          minLength: 1
+          description: 'Name: what the token is for.'
+          maxLength: 80
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopesEnum'
+          description: |-
+            Token scopes; write on a resource also grants read on it. Scopes:
+
+            - `account:read` — read: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes).
+            - `account:write` — read and write: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes).
+            - `transactions:read` — read: Transactions: list, details, create, edit and delete, attachments.
+            - `transactions:write` — read and write: Transactions: list, details, create, edit and delete, attachments.
+            - `accounts:read` — read: Accounts and their settings: balances, groups, loan and deposit terms.
+            - `accounts:write` — read and write: Accounts and their settings: balances, groups, loan and deposit terms.
+            - `analytics:read` — read: Analytics: reports, summaries, budgets and plans — what is computed from transactions.
+            - `analytics:write` — read and write: Analytics: reports, summaries, budgets and plans — what is computed from transactions.
+            - `categorization:read` — read: Categorization: categories, rules and keywords, labelling transactions.
+            - `categorization:write` — read and write: Categorization: categories, rules and keywords, labelling transactions.
+      required:
+      - expiry
+      - name
+      - scopes
+    ApiTokenCreated:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        prefix:
+          type: string
+          readOnly: true
+          description: Start of the token (psephi_pat_…), to recognize it in the list.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopesEnum'
+          readOnly: true
+          description: 'Token scopes: write on a resource also grants read; read is
+            not listed apart.'
+        expiry:
+          allOf:
+          - $ref: '#/components/schemas/ExpiryEnum'
+          readOnly: true
+          description: |-
+            Expiry kind: date (until a date), never, sliding (expires after idle_days without use).
+
+            * `date` - until a date
+            * `never` - never expires
+            * `sliding` - N days after the last use
+        expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'For expiry=date: when it expires'
+        idle_days:
+          type: integer
+          readOnly: true
+          nullable: true
+          description: 'For expiry=sliding: days without use before it expires'
+        valid_until:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'When it expires: the date, or the last use plus idle_days;
+            null: never.'
+        expired:
+          type: boolean
+          readOnly: true
+          description: 'Expired: the token no longer signs in.'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        last_used_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: Last use, to the minute.
+        token:
+          type: string
+          readOnly: true
+          description: 'The token itself. Shown once: the server keeps only its hash.'
+      required:
+      - created_at
+      - expired
+      - expires_at
+      - expiry
+      - id
+      - idle_days
+      - last_used_at
+      - name
+      - prefix
+      - scopes
+      - token
+      - valid_until
+    CategoryAmount:
+      type: object
+      properties:
+        category:
+          type: string
+          format: uuid
+          nullable: true
+          description: 'Category; null: uncategorized.'
+        amount:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Total for the period in this currency.
+      required:
+      - amount
+      - category
+    CategorySummary:
+      type: object
+      properties:
+        date_from:
+          type: string
+          format: date
+          description: Start of the period, inclusive.
+        date_to:
+          type: string
+          format: date
+          description: End of the period, inclusive.
+        expense:
+          type: array
+          items:
+            $ref: '#/components/schemas/CategoryAmount'
+          description: 'Spending: own share of expenses minus refunds, per (category,
+            currency), largest first; a total can be negative when refunds exceed
+            spending.'
+        income:
+          type: array
+          items:
+            $ref: '#/components/schemas/CategoryAmount'
+          description: Income per (category, currency), largest first.
+      required:
+      - date_from
+      - date_to
+      - expense
+      - income
+    CategoryTypeEnum:
+      enum:
+      - expense
+      - income
+      type: string
+      description: |-
+        * `expense` - Expense
+        * `income` - Income
+    CurrentToken:
+      type: object
+      description: |-
+        The request token (`GET /v1/token/`): a personal token or an OAuth access token. For an
+        OAuth token, id, name, expiry and last_used_at are those of its connection, and prefix is
+        `psephi_oat_`.
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        prefix:
+          type: string
+          readOnly: true
+          description: Start of the token (psephi_pat_…), to recognize it in the list.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopesEnum'
+          readOnly: true
+          description: 'Token scopes: write on a resource also grants read; read is
+            not listed apart.'
+        expiry:
+          allOf:
+          - $ref: '#/components/schemas/ExpiryEnum'
+          readOnly: true
+          description: |-
+            Expiry kind: date (until a date), never, sliding (expires after idle_days without use).
+
+            * `date` - until a date
+            * `never` - never expires
+            * `sliding` - N days after the last use
+        expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'For expiry=date: when it expires'
+        idle_days:
+          type: integer
+          readOnly: true
+          nullable: true
+          description: 'For expiry=sliding: days without use before it expires'
+        valid_until:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'When it expires: the date, or the last use plus idle_days;
+            null: never.'
+        expired:
+          type: boolean
+          readOnly: true
+          description: 'Expired: the token no longer signs in.'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        last_used_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: Last use, to the minute.
+        kind:
+          allOf:
+          - $ref: '#/components/schemas/CurrentTokenKindEnum'
+          readOnly: true
+          description: |-
+            personal: a personal token, oauth: an access token of a connected app.
+
+            * `personal` - personal
+            * `oauth` - oauth
+        client:
+          allOf:
+          - $ref: '#/components/schemas/TokenClient'
+          readOnly: true
+          nullable: true
+          description: 'For oauth: the app; otherwise null.'
+        access_expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: 'For oauth: when this access token expires (in about an hour);
+            otherwise null.'
+      required:
+      - access_expires_at
+      - client
+      - created_at
+      - expired
+      - expires_at
+      - expiry
+      - id
+      - idle_days
+      - kind
+      - last_used_at
+      - name
+      - prefix
+      - scopes
+      - valid_until
+    CurrentTokenKindEnum:
+      enum:
+      - personal
+      - oauth
+      type: string
+      description: |-
+        * `personal` - personal
+        * `oauth` - oauth
+    DirectionEnum:
+      enum:
+      - debit
+      - credit
+      type: string
+      description: |-
+        * `debit` - Debit
+        * `credit` - Credit
+    ExpiryEnum:
+      enum:
+      - date
+      - never
+      - sliding
+      type: string
+      description: |-
+        * `date` - until a date
+        * `never` - never expires
+        * `sliding` - N days after the last use
+    GrantTypeEnum:
+      enum:
+      - authorization_code
+      - refresh_token
+      - urn:ietf:params:oauth:grant-type:device_code
+      type: string
+      description: |-
+        * `authorization_code` - authorization_code
+        * `refresh_token` - refresh_token
+        * `urn:ietf:params:oauth:grant-type:device_code` - urn:ietf:params:oauth:grant-type:device_code
+    Links:
+      type: object
+      properties:
+        self:
+          type: string
+          format: uri
+          description: 'This address: the version root.'
+        schema:
+          type: string
+          format: uri
+          description: OpenAPI schema of the version.
+        docs:
+          type: string
+          format: uri
+          description: Documentation generated from the schema.
+        policy:
+          type: string
+          format: uri
+          description: Compatibility and deprecation policy.
+        problems:
+          type: string
+          format: uri
+          description: Catalog of error codes.
+      required:
+      - docs
+      - policy
+      - problems
+      - schema
+      - self
+    LocaleEnum:
+      enum:
+      - en
+      - ru
+      - pl
+      type: string
+      description: |-
+        * `en` - en
+        * `ru` - ru
+        * `pl` - pl
+    Money:
+      type: object
+      description: Amount with its currency.
+      properties:
+        amount:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,14}(?:\.\d{0,4})?$
+          description: Amount as a decimal string, four digits after the point.
+        currency:
+          type: string
+          description: 'Currency of the amount: ISO 4217 code.'
+      required:
+      - amount
+      - currency
+    OAuthDeviceRequestRequest:
+      type: object
+      properties:
+        client_id:
+          type: string
+          minLength: 1
+          description: Client, for example `psephi-cli`.
+        scope:
+          type: string
+          minLength: 1
+          description: Space-separated scopes.
+      required:
+      - client_id
+    OAuthDeviceResponse:
+      type: object
+      properties:
+        device_code:
+          type: string
+          description: Client secret for polling.
+        user_code:
+          type: string
+          description: 'Code for the person: XXXX-XXXX.'
+        verification_uri:
+          type: string
+          format: uri
+          description: Page to enter the code.
+        verification_uri_complete:
+          type: string
+          format: uri
+          description: The same page with the code filled in.
+        expires_in:
+          type: integer
+          description: Seconds until it expires (300).
+        interval:
+          type: integer
+          description: Seconds between polls.
+      required:
+      - device_code
+      - expires_in
+      - interval
+      - user_code
+      - verification_uri
+      - verification_uri_complete
+    OAuthError:
+      type: object
+      properties:
+        error:
+          type: string
+          description: 'OAuth error code: invalid_grant, slow_down, …'
+        error_description:
+          type: string
+          description: Explanation.
+      required:
+      - error
+    OAuthRevokeRequestRequest:
+      type: object
+      properties:
+        token:
+          type: string
+          minLength: 1
+          description: Access or refresh token.
+        token_type_hint:
+          type: string
+          minLength: 1
+          description: Not needed.
+        client_id:
+          type: string
+          minLength: 1
+          description: Client the token was issued to.
+      required:
+      - client_id
+      - token
+    OAuthTokenRequestRequest:
+      type: object
+      properties:
+        grant_type:
+          allOf:
+          - $ref: '#/components/schemas/GrantTypeEnum'
+          description: |-
+            Grant type: authorization code, refresh or device code.
+
+            * `authorization_code` - authorization_code
+            * `refresh_token` - refresh_token
+            * `urn:ietf:params:oauth:grant-type:device_code` - urn:ietf:params:oauth:grant-type:device_code
+        client_id:
+          type: string
+          minLength: 1
+          description: Client, for example `psephi-cli`.
+        code:
+          type: string
+          minLength: 1
+          description: 'authorization_code: the code from the redirect address.'
+        redirect_uri:
+          type: string
+          minLength: 1
+          description: 'authorization_code: the same address as in the authorize request.'
+        code_verifier:
+          type: string
+          minLength: 1
+          description: 'authorization_code: PKCE.'
+        refresh_token:
+          type: string
+          minLength: 1
+          description: 'refresh_token: the token.'
+        scope:
+          type: string
+          minLength: 1
+          description: 'refresh_token: space-separated scopes, no wider than granted.'
+        device_code:
+          type: string
+          minLength: 1
+          description: 'device_code: from the device authorization response.'
+      required:
+      - client_id
+      - grant_type
+    OAuthTokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: Access token `psephi_oat_…` for `/v1`.
+        token_type:
+          type: string
+          description: Always Bearer.
+        expires_in:
+          type: integer
+          description: Seconds the access token stays valid.
+        refresh_token:
+          type: string
+          description: 'Refresh token `psephi_ort_…`: single-use, exchanging it gives
+            a new pair.'
+        scope:
+          type: string
+          description: Space-separated scopes.
+      required:
+      - access_token
+      - expires_in
+      - refresh_token
+      - scope
+      - token_type
+    PaginatedApiCallList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiCall'
+    PaginatedApiTokenList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiToken'
+    PaginatedV1AccountList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/V1Account'
+    PaginatedV1BalanceList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/V1Balance'
+    PaginatedV1CategoryList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/V1Category'
+    PaginatedV1TransactionList:
+      type: object
+      required:
+      - results
+      properties:
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cD00ODY%3D"
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?cursor=cj0xJnA9NDg3
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/V1Transaction'
+    PatchedV1AccountUpdateRequest:
+      type: object
+      description: '`PATCH` body: only the declared fields.'
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: New name.
+          maxLength: 120
+        archived:
+          type: boolean
+          description: Archive or unarchive.
+        include_in_net_worth:
+          type: boolean
+          description: Whether to count it in net worth.
+    PatchedV1MeUpdateRequest:
+      type: object
+      description: '`PATCH` body: only the declared fields.'
+      properties:
+        display_name:
+          type: string
+          description: New name.
+          maxLength: 120
+        locale:
+          allOf:
+          - $ref: '#/components/schemas/LocaleEnum'
+          description: |-
+            New language.
+
+            * `en` - en
+            * `ru` - ru
+            * `pl` - pl
+        base_currency:
+          type: string
+          nullable: true
+          minLength: 1
+          description: New base currency (ISO 4217); null clears it.
+          maxLength: 3
+        time_zone:
+          type: string
+          description: New IANA time zone; an unknown name answers 400, an empty string
+            clears it.
+          maxLength: 64
+    PatchedV1TransactionUpdateRequest:
+      type: object
+      description: '`PATCH` body: only the declared fields.'
+      properties:
+        category:
+          type: string
+          format: uuid
+          nullable: true
+          description: New category, own or system, matching the transaction type
+            (an expense takes an expense category, income an income one); null removes
+            it. Transfers have no category.
+        description:
+          type: string
+          description: New note.
+          maxLength: 500
+        drop_parts:
+          type: boolean
+          description: 'Confirms removing the split: true lets a change of category
+            or kind of a split expense delete its parts and their categories. Without
+            it such a change answers 400 with an error in the drop_parts field.'
+    Problem:
+      type: object
+      description: |-
+        API error, RFC 9457 (`application/problem+json`). Codes:
+
+        - `bad_request` (400, Bad request): The request was not accepted; the server gave no more specific reason.
+        - `validation_error` (400, Invalid input): The request data failed validation. Field errors are in `fields`, a general one in `detail`.
+        - `parse_error` (400, Malformed request): The request body cannot be parsed: broken JSON, wrong file format, damaged spreadsheet.
+        - `invalid_cursor` (400, Invalid page cursor): The page cursor (`cursor`) is invalid or damaged: take it only from `next` or `previous` of a list response; no cursor means the first page.
+        - `not_authenticated` (401, Not signed in): Sign-in required: there is no session or it has expired. Header `WWW-Authenticate: Session`; on the public API host it is `Bearer`: the `Authorization: Bearer <token>` header is missing.
+        - `authentication_failed` (401, Authentication failed): The request credentials were not accepted.
+        - `permission_denied` (403, Access denied): Signed in, but this action is not allowed.
+        - `csrf_failed` (403, CSRF check failed): The CSRF token is missing or stale: get a new one from `GET /api/auth/csrf/` and repeat the request.
+        - `not_found` (404, Not found): No such address or object, or it belongs to someone else: other people's data answers with the same 404.
+        - `method_not_allowed` (405, Method not allowed): This HTTP method is not supported at this address.
+        - `not_acceptable` (406, Not acceptable): No response in the format from `Accept`: the API answers with JSON.
+        - `conflict` (409, Conflict): The action conflicts with the current state of the data; what is in the way is in `detail`.
+        - `gone` (410, Gone): The object no longer exists.
+        - `payload_too_large` (413, Request too large): The request body is larger than allowed. A file too large for a form field is an error of that field (`validation_error`), not 413.
+        - `unsupported_media_type` (415, Unsupported media type): The body is in the wrong format (`Content-Type`): the API accepts JSON, files as multipart.
+        - `throttled` (429, Too many requests): Rate limit exceeded. How many seconds to wait before retrying is in `retry_after` and the `Retry-After` header.
+        - `server_error` (500, Server error): Server failure. The response has no details; they are in the server log.
+        - `not_implemented` (501, Not implemented): The feature is declared but not built yet (for example, an export format).
+        - `bad_gateway` (502, Upstream service failed): An external service (bank, aggregator) answered with an error or did not answer.
+        - `service_unavailable` (503, Service unavailable): The service is temporarily unavailable; retry later.
+        - `pending_approval` (403, Sign-up awaiting approval): The sign-up is not approved yet: only sign-in and the own account (/api/auth/) are open.
+        - `reauth` (403, Sign in again): The action needs a fresh sign-in (within the last 10 minutes): sign in again and repeat.
+        - `wrong_credentials` (400, Wrong email or password): Password sign-in: the email or password does not match.
+        - `wrong_code` (400, Wrong code): The code (from an email, an authenticator app or a backup code) does not match or has expired.
+        - `invalid_code` (400, Invalid code or link): The code or link from the email is wrong or no longer valid; request new ones.
+        - `login_expired` (400, Sign-in expired): The second sign-in step was not started or waited too long; start signing in again.
+        - `key_rejected` (400, Passkey not accepted): The passkey (WebAuthn) was not accepted; try again.
+        - `too_many_attempts` (429, Too many attempts): Too many wrong attempts at the second step; wait.
+        - `last_second_factor` (409, Last second method): This is the last second sign-in method while one is required: add another one or turn the requirement off together with it.
+        - `no_second_factor` (400, No second method): A second method cannot be required while there is none: add a passkey or an authenticator app.
+        - `email_same` (400, Same address): Email change: this is already the current address.
+        - `email_taken` (400, Address taken): Email change: the address belongs to another account.
+        - `email_changed_recently` (409, Address changed recently): Email change: the address was changed recently; retry in a few days.
+        - `email_change_waiting` (409, Address change already waiting): Email change: a change is already waiting; cancel it first.
+        - `email_change_limit` (429, Too many address changes): Email change: too many requests in a day; retry tomorrow.
+        - `email_sent_recently` (429, Email just sent): An email has just been sent; wait a minute before retrying.
+        - `nothing_to_confirm` (404, Nothing to confirm): Nothing is waiting for confirmation (an email change, removal of a sign-in method).
+        - `token_expired` (401, API token expired): The API token has expired: its date passed or its sliding lifetime ran out without use; create a new one. Header `WWW-Authenticate: Bearer error="invalid_token"`.
+        - `token_revoked` (401, API token revoked): The API token was revoked; create a new one. Header `WWW-Authenticate: Bearer error="invalid_token"`.
+        - `insufficient_scope` (403, Insufficient token scope): The token lacks a scope for this action; the missing ones are in `required_scopes` and in the `WWW-Authenticate: Bearer error="insufficient_scope"` header. A token created with a token is no wider than its scopes.
+        - `oauth_invalid_request` (400, Invalid authorization request): The OAuth authorize request from the app was not accepted: the OAuth error code is in `error`; `redirect` is the app's return address carrying this error, or null when the address cannot be trusted (unknown client or unregistered redirect_uri), and then only show the error.
+        - `too_many_connections` (409, Too many connected apps): The person already has the maximum of connected (OAuth) apps (50); disconnect unused ones in Account > Connected apps.
+        - `personal_token_required` (403, Personal token required): An API token can only be created in the web app or with a personal token: an app connected through OAuth cannot create itself a permanent token that would survive revoking the connection.
+        - `too_many_tokens` (409, Too many tokens): Too many active API tokens; revoke unused ones.
+        - `in_use` (409, In use): The object cannot be deleted: other data refers to it (what exactly is in `detail`).
+        - `duplicate` (409, Already exists): This already exists. For an attachment, the earlier one is in `transaction` and `attachment`.
+        - `deleted` (410, Deleted): Sync: the record was deleted on the server.
+        - `resync` (410, Download everything again): Sync: the cursor is stale; download all data again, without a cursor.
+        - `import_in_progress` (409, Import in progress): This file is already being imported; retry in a minute.
+        - `not_recognized` (400, File not recognized): Import: the file format was not recognized. The error is in `fields.file`; a matching shared preset of the same format for the editor is in `preset_suggestion` (or null).
+        - `password_required` (400, PDF password required): The PDF is password-protected: pass the password in `password`.
+        - `password_wrong` (400, Wrong PDF password): The password does not open this PDF.
+        - `sync_rejected` (400, Change rejected): Sync: the conflict resolution was not accepted. The operation result is in `result`.
+        - `keywords_rejected` (400, Keywords not imported): Keyword import: the list has errors and nothing was saved. Per-row results are in `result`.
+        - `credential_revoked` (409, Application key revoked): The aggregator application key was revoked; replace it.
+        - `sync_in_progress` (409, Already syncing): The bank is already syncing; wait for it to finish.
+        - `bank_error` (400, Bank refused): The bank aggregator refused (key, consent, data); a readable reason is in `detail`.
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Problem type URI, derived from the code
+        title:
+          type: string
+          description: Short name of the problem, in the language of the request
+        status:
+          type: integer
+          description: HTTP status of the response
+        detail:
+          type: string
+          description: What happened, in the language of the request
+        instance:
+          type: string
+          description: Request path
+        code:
+          type: string
+          enum:
+          - bad_request
+          - validation_error
+          - parse_error
+          - invalid_cursor
+          - not_authenticated
+          - authentication_failed
+          - permission_denied
+          - csrf_failed
+          - not_found
+          - method_not_allowed
+          - not_acceptable
+          - conflict
+          - gone
+          - payload_too_large
+          - unsupported_media_type
+          - throttled
+          - server_error
+          - not_implemented
+          - bad_gateway
+          - service_unavailable
+          - pending_approval
+          - reauth
+          - wrong_credentials
+          - wrong_code
+          - invalid_code
+          - login_expired
+          - key_rejected
+          - too_many_attempts
+          - last_second_factor
+          - no_second_factor
+          - email_same
+          - email_taken
+          - email_changed_recently
+          - email_change_waiting
+          - email_change_limit
+          - email_sent_recently
+          - nothing_to_confirm
+          - token_expired
+          - token_revoked
+          - insufficient_scope
+          - oauth_invalid_request
+          - too_many_connections
+          - personal_token_required
+          - too_many_tokens
+          - in_use
+          - duplicate
+          - deleted
+          - resync
+          - import_in_progress
+          - not_recognized
+          - password_required
+          - password_wrong
+          - sync_rejected
+          - keywords_rejected
+          - credential_revoked
+          - sync_in_progress
+          - bank_error
+          description: Stable machine code from the catalog
+        fields:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              properties:
+                code:
+                  type: string
+                  description: Field error code (required, invalid, …)
+                message:
+                  type: string
+                  description: Message in the language of the request
+              required:
+              - code
+              - message
+          description: 'Field errors: dotted path (lines.0.amount) → errors'
+        retry_after:
+          type: integer
+          description: 'throttled: seconds to wait before retrying (also Retry-After)'
+        error:
+          type: string
+          description: 'oauth_invalid_request: OAuth error code (RFC 6749)'
+        redirect:
+          type: string
+          nullable: true
+          description: 'oauth_invalid_request: return address to the app with the
+            error'
+        required_scopes:
+          type: array
+          items:
+            type: string
+          description: 'insufficient_scope: scopes the token is missing'
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - instance
+      - code
+    ProblemCatalog:
+      type: object
+      properties:
+        problems:
+          type: array
+          items:
+            $ref: '#/components/schemas/Problem'
+          description: Every code the API may answer with.
+      required:
+      - problems
+    Root:
+      type: object
+      properties:
+        version:
+          type: string
+          description: 'API version in the path: v1.'
+        links:
+          allOf:
+          - $ref: '#/components/schemas/Links'
+          description: Links of the version.
+      required:
+      - links
+      - version
+    ScopesEnum:
+      enum:
+      - account:read
+      - account:write
+      - transactions:read
+      - transactions:write
+      - accounts:read
+      - accounts:write
+      - analytics:read
+      - analytics:write
+      - categorization:read
+      - categorization:write
+      type: string
+      description: |-
+        * `account:read` - account:read
+        * `account:write` - account:write
+        * `transactions:read` - transactions:read
+        * `transactions:write` - transactions:write
+        * `accounts:read` - accounts:read
+        * `accounts:write` - accounts:write
+        * `analytics:read` - analytics:read
+        * `analytics:write` - analytics:write
+        * `categorization:read` - categorization:read
+        * `categorization:write` - categorization:write
+    StatusEnum:
+      enum:
+      - hold
+      - cleared
+      - reversed
+      type: string
+      description: |-
+        * `hold` - Hold
+        * `cleared` - Cleared
+        * `reversed` - Reversed
+    Suggestion:
+      type: object
+      properties:
+        category:
+          type: string
+          format: uuid
+          description: Suggested category.
+        probability:
+          type: number
+          format: double
+          description: Model confidence, from 0 to 1.
+      required:
+      - category
+      - probability
+    Suggestions:
+      type: object
+      properties:
+        transaction:
+          type: string
+          format: uuid
+          description: Transaction.
+        category:
+          type: string
+          format: uuid
+          nullable: true
+          description: What the categorizer would set on its own; null if it would
+            not.
+        confidence:
+          type: number
+          format: double
+          description: Confidence in this choice, from 0 to 1.
+        source:
+          type: string
+          description: 'Where the choice comes from: rule, keyword, model, marketplace
+            (a marketplace order: suggestions only), none (no suggestions).'
+        suggestions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Suggestion'
+          description: Best categories by descending confidence; empty if none.
+      required:
+      - category
+      - confidence
+      - source
+      - suggestions
+      - transaction
+    TokenClient:
+      type: object
+      properties:
+        client_id:
+          type: string
+          description: 'App ID: psephi-cli and the like.'
+        name:
+          type: string
+          description: App name.
+      required:
+      - client_id
+      - name
+    TransactionKindEnum:
+      enum:
+      - expense
+      - income
+      - refund
+      - transfer_out
+      - transfer_in
+      - exchange_out
+      - exchange_in
+      - loan_given
+      - loan_repaid
+      - debt_taken
+      - debt_repaid
+      - cash_advance_out
+      - cash_advance_in
+      - trade_buy
+      - trade_sell
+      type: string
+      description: |-
+        * `expense` - Expense
+        * `income` - Income
+        * `refund` - Refund
+        * `transfer_out` - Transfer Out
+        * `transfer_in` - Transfer In
+        * `exchange_out` - Exchange Out
+        * `exchange_in` - Exchange In
+        * `loan_given` - Loan Given
+        * `loan_repaid` - Loan Repaid
+        * `debt_taken` - Debt Taken
+        * `debt_repaid` - Debt Repaid
+        * `cash_advance_out` - Cash Advance Out
+        * `cash_advance_in` - Cash Advance In
+        * `trade_buy` - Trade Buy
+        * `trade_sell` - Trade Sell
+    V1Account:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Account ID.
+        name:
+          type: string
+          description: Account name.
+        kind:
+          allOf:
+          - $ref: '#/components/schemas/AccountKindEnum'
+          description: |-
+            Kind: current, savings, deposit, card, loan, cash, brokerage…
+
+            * `current` - Current
+            * `savings` - Savings
+            * `deposit` - Deposit
+            * `credit_card` - Credit Card
+            * `loan` - Loan
+            * `mortgage` - Mortgage
+            * `bnpl` - Bnpl
+            * `brokerage` - Brokerage
+            * `cash` - Cash
+            * `paid_by_others` - Paid By Others
+        currency:
+          type: string
+          description: Account currency, ISO 4217.
+        parent:
+          type: string
+          format: uuid
+          nullable: true
+          description: The account this one is a subaccount of.
+        archived:
+          type: boolean
+          description: 'Archived: hidden from lists and pickers.'
+        include_in_net_worth:
+          type: boolean
+          description: Counted in net worth.
+        created_at:
+          type: string
+          format: date-time
+          description: When the account was added to Psephi.
+      required:
+      - archived
+      - created_at
+      - currency
+      - id
+      - include_in_net_worth
+      - kind
+      - name
+      - parent
+    V1Balance:
+      type: object
+      properties:
+        account:
+          type: string
+          format: uuid
+          description: Account.
+        name:
+          type: string
+          description: Account name.
+        balance:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          readOnly: true
+          description: 'Available, as in the bank app: booked plus holds.'
+        booked_balance:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          readOnly: true
+          description: Booked balance, without holds.
+        on_hold:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          readOnly: true
+          description: 'Holds, signed: spending negative, incoming positive.'
+      required:
+      - account
+      - balance
+      - booked_balance
+      - name
+      - on_hold
+    V1Category:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Category ID.
+        parent:
+          type: string
+          format: uuid
+          nullable: true
+          description: Group of the category; null for a group itself.
+        type:
+          allOf:
+          - $ref: '#/components/schemas/CategoryTypeEnum'
+          description: |-
+            expense: spending category, income: income category.
+
+            * `expense` - Expense
+            * `income` - Income
+        slug:
+          type: string
+          description: Stable key of a system category.
+        name:
+          type: string
+          description: Name in the language of the request (Accept-Language).
+        is_system:
+          type: boolean
+          description: System (from the catalog) or own.
+        enabled:
+          type: boolean
+          description: 'Enabled for the person: available to pick.'
+      required:
+      - enabled
+      - id
+      - is_system
+      - name
+      - parent
+      - slug
+      - type
+    V1Me:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Person ID.
+        email:
+          type: string
+          format: email
+          readOnly: true
+          description: Account email; cannot be changed through the API.
+        display_name:
+          type: string
+          description: Name as shown in the app.
+        locale:
+          allOf:
+          - $ref: '#/components/schemas/LocaleEnum'
+          description: |-
+            Language of the app, emails and API responses by default.
+
+            * `en` - en
+            * `ru` - ru
+            * `pl` - pl
+        base_currency:
+          type: string
+          nullable: true
+          description: Base currency (ISO 4217) for totals and analytics; null if
+            not chosen.
+        time_zone:
+          type: string
+          description: 'The person''s time zone, an IANA database name such as `Europe/Warsaw`;
+            an empty string means not set. Only stored for now: the server computes
+            "today" and period bounds in UTC.'
+      required:
+      - base_currency
+      - display_name
+      - email
+      - id
+      - locale
+      - time_zone
+    V1Transaction:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Transaction ID.
+        account:
+          type: string
+          format: uuid
+          description: Account of the transaction.
+        date:
+          type: string
+          format: date
+          description: Transaction date (or hold date).
+        booked_date:
+          type: string
+          format: date
+          nullable: true
+          description: Date the bank booked it; null while it is still a hold.
+        status:
+          allOf:
+          - $ref: '#/components/schemas/StatusEnum'
+          description: |-
+            hold: on hold, cleared: booked, reversed: cancelled.
+
+            * `hold` - Hold
+            * `cleared` - Cleared
+            * `reversed` - Reversed
+        kind:
+          allOf:
+          - $ref: '#/components/schemas/TransactionKindEnum'
+          description: |-
+            Kind of transaction: expense, income, refund, transfer, exchange, loan, trade…
+
+            * `expense` - Expense
+            * `income` - Income
+            * `refund` - Refund
+            * `transfer_out` - Transfer Out
+            * `transfer_in` - Transfer In
+            * `exchange_out` - Exchange Out
+            * `exchange_in` - Exchange In
+            * `loan_given` - Loan Given
+            * `loan_repaid` - Loan Repaid
+            * `debt_taken` - Debt Taken
+            * `debt_repaid` - Debt Repaid
+            * `cash_advance_out` - Cash Advance Out
+            * `cash_advance_in` - Cash Advance In
+            * `trade_buy` - Trade Buy
+            * `trade_sell` - Trade Sell
+        direction:
+          allOf:
+          - $ref: '#/components/schemas/DirectionEnum'
+          description: |-
+            debit: money left the account, credit: money came in.
+
+            * `debit` - Debit
+            * `credit` - Credit
+        amount:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          readOnly: true
+          description: Amount in the account currency, unsigned.
+        original_amount:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          readOnly: true
+          nullable: true
+          description: Amount in the currency of the purchase itself, if it differs;
+            otherwise null.
+        merchant_name:
+          type: string
+          description: Merchant as reported by the bank; empty if none.
+        bank_description:
+          type: string
+          description: Description from the bank, as received.
+        description:
+          type: string
+          description: The person's own note; empty if none.
+        category:
+          type: string
+          format: uuid
+          nullable: true
+          description: 'Category (see `/v1/categories/`); for a split expense, its
+            largest part; null: uncategorized.'
+        confirmed:
+          type: boolean
+          description: 'The person confirmed the transaction: in the web app, through
+            the API or MCP.'
+        created_at:
+          type: string
+          format: date-time
+          description: When the transaction appeared in Psephi.
+        updated_at:
+          type: string
+          format: date-time
+          description: When the transaction last changed.
+      required:
+      - account
+      - amount
+      - bank_description
+      - booked_date
+      - category
+      - confirmed
+      - created_at
+      - date
+      - description
+      - direction
+      - id
+      - kind
+      - merchant_name
+      - original_amount
+      - status
+      - updated_at
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |-
+        Personal API token: `Authorization: Bearer psephi_pat_…`, created in the account settings (Account → API tokens) or with `POST /v1/tokens/`. Or an OAuth 2.1 access token `psephi_oat_…` — a program signing in through the browser (authorization code with PKCE, or device code); the authorization server is described at `/.well-known/oauth-authorization-server`.
+
+        Token scopes (each operation lists the ones it needs in `x-required-scopes`; write on a resource also grants read on it):
+
+        - `account:read` — read: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes).
+        - `account:write` — read and write: Account settings: profile, language, API tokens. Write also creates and revokes tokens (no wider than its own scopes).
+        - `transactions:read` — read: Transactions: list, details, create, edit and delete, attachments.
+        - `transactions:write` — read and write: Transactions: list, details, create, edit and delete, attachments.
+        - `accounts:read` — read: Accounts and their settings: balances, groups, loan and deposit terms.
+        - `accounts:write` — read and write: Accounts and their settings: balances, groups, loan and deposit terms.
+        - `analytics:read` — read: Analytics: reports, summaries, budgets and plans — what is computed from transactions.
+        - `analytics:write` — read and write: Analytics: reports, summaries, budgets and plans — what is computed from transactions.
+        - `categorization:read` — read: Categorization: categories, rules and keywords, labelling transactions.
+        - `categorization:write` — read and write: Categorization: categories, rules and keywords, labelling transactions.
+      x-scopes:
+        account:read: 'read: Account settings: profile, language, API tokens. Write
+          also creates and revokes tokens (no wider than its own scopes).'
+        account:write: 'read and write: Account settings: profile, language, API tokens.
+          Write also creates and revokes tokens (no wider than its own scopes).'
+        transactions:read: 'read: Transactions: list, details, create, edit and delete,
+          attachments.'
+        transactions:write: 'read and write: Transactions: list, details, create,
+          edit and delete, attachments.'
+        accounts:read: 'read: Accounts and their settings: balances, groups, loan
+          and deposit terms.'
+        accounts:write: 'read and write: Accounts and their settings: balances, groups,
+          loan and deposit terms.'
+        analytics:read: 'read: Analytics: reports, summaries, budgets and plans —
+          what is computed from transactions.'
+        analytics:write: 'read and write: Analytics: reports, summaries, budgets and
+          plans — what is computed from transactions.'
+        categorization:read: 'read: Categorization: categories, rules and keywords,
+          labelling transactions.'
+        categorization:write: 'read and write: Categorization: categories, rules and
+          keywords, labelling transactions.'

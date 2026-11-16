@@ -143,7 +143,7 @@ wheel and sdist → a PR to the tap `psephi-app/homebrew-psephi` with the new
 Set up once: the PyPI trusted publisher for this workflow (project `psephi`, owner
 `psephi-app`, repository `psephi-cli`, workflow `release.yml`, environment `pypi`), the
 GitHub environment `pypi` (tags `v*` only), and a GitHub App with *Contents* and *Pull
-requests* read & write on `homebrew-psephi` only — variable `TAP_APP_ID` and secret
+requests* read & write on `homebrew-psephi` only — secrets `TAP_APP_ID` and
 `TAP_APP_PRIVATE_KEY` here.
 
 To release: bump `__version__` in `src/psephi/__init__.py`, then
